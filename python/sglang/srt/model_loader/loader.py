@@ -1915,6 +1915,13 @@ class GGUFModelLoader(BaseModelLoader):
 
         config = model_config.hf_config
         model_type = config.model_type
+        derived_head_dim = config.hidden_size // config.num_attention_heads
+        actual_head_dim = getattr(config, "head_dim", derived_head_dim)
+        if actual_head_dim != derived_head_dim:
+            logger.info(f"Using explicit head_dim={actual_head_dim} (derived would be {derived_head_dim})")
+            # Ensure model uses explicit head_dim
+            if not hasattr(config, "head_dim"):
+                config.head_dim = actual_head_dim
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
