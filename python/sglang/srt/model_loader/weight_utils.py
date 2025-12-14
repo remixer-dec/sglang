@@ -955,7 +955,26 @@ def gguf_quant_weights_iterator(
     import gguf
 
     reader = gguf.GGUFReader(gguf_file)
+    num_heads = None
+    num_kv_heads = None
 
+    for name, field in reader.fields.items():
+        if num_heads is None and name.endswith(".attention.head_count"):
+            num_heads = int(field.parts[-1])
+        elif num_kv_heads is None and name.endswith(".attention.head_count_kv"):
+            num_kv_heads = int(field.parts[-1])
+        if num_heads is not None and num_kv_heads is not None:
+            break
+
+    def reverse_permute(weights, n_head, n_kv_head=None):
+        """Reverse the permutation applied by llama.cpp during HF->GGUF conversion"""
+        if n_kv_head is not None and n_head != n_kv_head:
+            n_head = n_kv_head
+        dim = weights.shape[0] // n_head // 2
+        w = weights.reshape(n_head, dim, 2, *weights.shape[1:])
+        return w.swapaxes(2, 1).reshape(weights.shape)
+
+    # First pass: yield weight types
     for tensor in reader.tensors:
         if tensor.name in gguf_to_hf_name_map:
             weight_type = tensor.tensor_type
@@ -966,11 +985,18 @@ def gguf_quant_weights_iterator(
                 weight_type = torch.tensor(weight_type)
                 yield weight_type_name, weight_type
 
+    # Second pass: yield weights with reverse permutation for Q/K
     for tensor in reader.tensors:
         if tensor.name in gguf_to_hf_name_map:
             weight = tensor.data
             weight_type = tensor.tensor_type
             name = gguf_to_hf_name_map[tensor.name]
+
+            # Apply reverse permutation for Q/K attention weights
+            if num_heads and "attn_q" in tensor.name:
+                weight = reverse_permute(weight, num_heads, num_heads)
+            elif num_kv_heads and "attn_k" in tensor.name:
+                weight = reverse_permute(weight, num_heads, num_kv_heads)
 
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
