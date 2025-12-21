@@ -4186,6 +4186,9 @@ class ServerArgs:
             return f"http://{self.host}:{self.port}"
 
     def get_hf_config(self):
+        # Sanitize FlashHead config before loading to avoid embedl dependency
+        self._sanitize_flash_head_config_if_needed()
+
         kwargs = {}
         hf_config = get_config(
             self.model_path,
@@ -4195,6 +4198,40 @@ class ServerArgs:
             **kwargs,
         )
         return hf_config
+
+    def _sanitize_flash_head_config_if_needed(self):
+        """Sanitize FlashHead model config to allow loading without embedl package."""
+        if not os.path.isdir(self.model_path):
+            return  # Skip for remote models or GGUF files
+
+        config_path = os.path.join(self.model_path, "config.json")
+        if not os.path.exists(config_path):
+            return
+
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = json.load(f)
+
+            # Check if this is a FlashHead model that needs sanitization
+            needs_sanitization = False
+            if "auto_map" in config:
+                auto_map_str = str(config["auto_map"])
+                if "embedl" in auto_map_str or "FlashHead" in auto_map_str:
+                    needs_sanitization = True
+            if "architectures" in config:
+                for arch in config["architectures"]:
+                    if "FlashHead" in arch:
+                        needs_sanitization = True
+                        break
+            if "model_type" in config and "flash_head_" in config.get("model_type", ""):
+                needs_sanitization = True
+
+            if needs_sanitization:
+                from sglang.srt.layers.flash_head import sanitize_flash_head_config
+                sanitize_flash_head_config(self.model_path)
+
+        except (json.JSONDecodeError, IOError):
+            pass  # Ignore errors, let normal loading handle them
 
     def get_model_config(self):
         # Lazy init to avoid circular import

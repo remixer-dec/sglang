@@ -539,6 +539,76 @@ def detect_flash_head_config(
     return None, None
 
 
+def sanitize_flash_head_config(model_dir: str) -> bool:
+    """
+    Sanitize the config.json to remove FlashHead-specific fields.
+
+    This allows loading FlashHead models as standard models (e.g., Llama, Qwen)
+    without requiring the embedl package. The FlashHead acceleration is applied
+    separately after model loading.
+
+    Args:
+        model_dir: The model directory path.
+
+    Returns:
+        True if config was modified, False otherwise.
+    """
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(config_path):
+        return False
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+
+        modified = False
+
+        # Remove auto_map which references embedl package
+        if "auto_map" in config:
+            logger.info("[FlashHead] Removing auto_map from config.json")
+            del config["auto_map"]
+            modified = True
+
+        # Update architectures - remove "FlashHead" from architecture names
+        if "architectures" in config:
+            new_architectures = []
+            for arch in config["architectures"]:
+                if "FlashHead" in arch:
+                    # e.g., "FlashHeadLlamaForCausalLM" -> "LlamaForCausalLM"
+                    new_arch = arch.replace("FlashHead", "")
+                    logger.info(
+                        f"[FlashHead] Updating architecture: {arch} -> {new_arch}"
+                    )
+                    new_architectures.append(new_arch)
+                    modified = True
+                else:
+                    new_architectures.append(arch)
+            if modified:
+                config["architectures"] = new_architectures
+
+        # Update model_type - remove "flash_head_" prefix
+        if "model_type" in config:
+            model_type = config["model_type"]
+            if "flash_head_" in model_type:
+                new_model_type = model_type.replace("flash_head_", "")
+                logger.info(
+                    f"[FlashHead] Updating model_type: {model_type} -> {new_model_type}"
+                )
+                config["model_type"] = new_model_type
+                modified = True
+
+        if modified:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+            logger.info(f"[FlashHead] Config sanitized at {config_path}")
+
+        return modified
+
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning(f"[FlashHead] Error sanitizing config: {e}")
+        return False
+
+
 def get_flash_head_special_token_ids(model_dir: str) -> Optional[list]:
     """
     Get special token IDs from the model config for FlashHead.
