@@ -144,6 +144,12 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # Whether to return logprobs (for any forward mode, including decode)
+    return_logprob: bool = False
+
+    # FlashHead approximate logprob (set by _get_logits when FlashHead is used with logprobs)
+    flash_head_logprob: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -194,6 +200,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            return_logprob=forward_batch.return_logprob,
         )
 
     def compute_dp_attention_metadata(self):
@@ -603,11 +610,15 @@ class LogitsProcessor(nn.Module):
                 logits[sample_indices] if sample_indices is not None else logits
             )
 
+            # Check if FlashHead provided an approximate logprob
+            flash_head_logprob = getattr(logits_metadata, "flash_head_logprob", None)
+
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 full_logits=full_logits,
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                next_token_logprobs=flash_head_logprob,
             )
 
         # Start to process input logprobs
@@ -887,19 +898,34 @@ class LogitsProcessor(nn.Module):
         this case.
         """
         # FlashHead fast path: use FlashHead for single-token generation
-        # Returns token IDs directly instead of logits
+        # Returns token IDs directly instead of logits (with optional approximate logprob)
         if (
             self.flash_head is not None
             and hidden_states.shape[0] == 1
-            and not logits_metadata.extend_return_logprob
             and logits_metadata.forward_mode.is_decode_or_idle()
         ):
             # FlashHead expects [batch, seq_len, hidden_size]
             # hidden_states is [batch * seq_len, hidden_size]
             hidden_states_3d = hidden_states.unsqueeze(0)
-            next_token_ids = self.flash_head.get_next_token(hidden_states_3d)
+
+            # Check if logprobs are needed
+            need_logprobs = (
+                logits_metadata.extend_return_logprob
+                or logits_metadata.return_logprob
+            )
+
+            if need_logprobs:
+                # Get token with approximate logprob
+                next_token_ids, approx_logprob = self.flash_head.get_next_token(
+                    hidden_states_3d, return_logprob=True
+                )
+                # Store the logprob in metadata for the sampler to use
+                logits_metadata.flash_head_logprob = approx_logprob
+            else:
+                next_token_ids = self.flash_head.get_next_token(hidden_states_3d)
+
             # Return token IDs in a format the sampler can detect
-            # Shape: [1, 1] with dtype int64
+            # Shape: [1] with dtype int64
             return next_token_ids.view(-1).to(torch.int64)
 
         if self.do_tensor_parallel_all_gather_dp_attn:

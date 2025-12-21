@@ -94,13 +94,21 @@ class Sampler(nn.Module):
         ) and logits.dtype in (torch.int32, torch.int64):
             # FlashHead returned token IDs directly, skip sampling
             batch_next_token_ids = logits.view(-1).to(torch.int32)
-            # Note: logprobs are not available when using FlashHead fast path
-            # The user should not request logprobs when FlashHead is active
+
+            # Handle logprobs if requested - FlashHead provides approximate logprobs
             if return_logprob:
-                logger.warning(
-                    "[FlashHead] Logprobs not available when using FlashHead fast path. "
-                    "Disable FlashHead or don't request logprobs."
-                )
+                # Check if FlashHead already computed logprobs
+                if logits_output.next_token_logprobs is not None:
+                    # Logprobs already set by LogitsProcessor from FlashHead
+                    # Note: top_logprobs and token_ids_logprobs are not available
+                    # with FlashHead since we don't have full vocabulary logits
+                    pass
+                else:
+                    logger.warning(
+                        "[FlashHead] Logprobs requested but not computed. "
+                        "This may indicate an issue with FlashHead configuration."
+                    )
+
             return batch_next_token_ids
 
         # Preprocess logits (custom processors and NaN handling)

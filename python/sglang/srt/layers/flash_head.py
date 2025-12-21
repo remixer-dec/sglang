@@ -361,6 +361,7 @@ class FlashHead(nn.Module):
         do_sample: bool = False,
         temperature: float = 1.0,
         use_identical_tiebreak: bool = False,
+        return_logprob: bool = False,
     ) -> torch.Tensor:
         """
         Return the next token, given `hidden_states`.
@@ -375,9 +376,12 @@ class FlashHead(nn.Module):
             use_identical_tiebreak: Whether to reorder the logits so that when two
                 logits are the same, the new head will use the same tiebreak as
                 the original.
+            return_logprob: Whether to return the logprob of the selected token.
+                When True, returns (token_id, logprob) tuple.
 
         Returns:
             The next predicted token ID as a tensor with shape [1, 1].
+            If return_logprob is True, returns a tuple of (token_id, logprob).
         """
         top_clusters = self._get_top_clusters(
             hidden_states,
@@ -388,11 +392,14 @@ class FlashHead(nn.Module):
             hidden_states, top_clusters, use_identical_tiebreak
         )
 
+        # Get the logits for the last position
+        last_logits = cluster_logits[:, -1, :]  # [1, num_cluster_tokens]
+
         if do_sample:
-            probs = (cluster_logits[:, -1, :] / temperature).softmax(dim=-1)
+            probs = (last_logits / temperature).softmax(dim=-1)
             cluster_token_idx = torch.multinomial(probs, num_samples=1)
         else:
-            cluster_token_idx = cluster_logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            cluster_token_idx = last_logits.argmax(dim=-1, keepdim=True)
             if use_identical_tiebreak and mapping is not None:
                 cluster_token_idx = mapping[cluster_token_idx]
 
@@ -407,6 +414,27 @@ class FlashHead(nn.Module):
 
         vocab_index = indices[cluster_token_idx]
         self.output_buffer[0][0] = vocab_index.item()
+
+        if return_logprob:
+            # Compute approximate logprob using cluster logits
+            # This is log_softmax over the cluster tokens, not full vocab
+            # For a more accurate approximation, we add a correction term
+            # based on the cluster selection probabilities
+            log_probs = torch.nn.functional.log_softmax(last_logits, dim=-1)
+            selected_logprob = log_probs[0, cluster_token_idx.squeeze()]
+
+            # Add cluster probability as a correction term
+            # This accounts for the probability of selecting this cluster
+            cluster_probs = self._get_cluster_probs(hidden_states, temperature)
+            cluster_log_prob = torch.log(
+                cluster_probs[0, 0, cluster_indices].sum() + 1e-10
+            )
+
+            # Approximate full logprob = cluster_logprob + log(sum of cluster probs)
+            approx_logprob = selected_logprob + cluster_log_prob
+
+            return self.output_buffer, approx_logprob.view(1)
+
         return self.output_buffer
 
 
