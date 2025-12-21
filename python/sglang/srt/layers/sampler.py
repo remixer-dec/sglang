@@ -86,6 +86,23 @@ class Sampler(nn.Module):
         """
         logits = logits_output.next_token_logits
 
+        # FlashHead fast path: when LogitsProcessor returns token IDs directly
+        # instead of logits (detected by 1D shape or [N, 1] shape with int dtype)
+        if logits is not None and (
+            logits.ndim == 1
+            or (logits.ndim == 2 and logits.shape[1] == 1)
+        ) and logits.dtype in (torch.int32, torch.int64):
+            # FlashHead returned token IDs directly, skip sampling
+            batch_next_token_ids = logits.view(-1).to(torch.int32)
+            # Note: logprobs are not available when using FlashHead fast path
+            # The user should not request logprobs when FlashHead is active
+            if return_logprob:
+                logger.warning(
+                    "[FlashHead] Logprobs not available when using FlashHead fast path. "
+                    "Disable FlashHead or don't request logprobs."
+                )
+            return batch_next_token_ids
+
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
 

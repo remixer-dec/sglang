@@ -226,6 +226,34 @@ class ModelConfig:
             self.hf_config, "is_matryoshka", False
         )
 
+        # FlashHead support detection
+        self._detect_flash_head()
+
+    def _detect_flash_head(self) -> None:
+        """Detect if the model supports FlashHead acceleration."""
+        from sglang.srt.layers.flash_head import (
+            detect_flash_head_config,
+            get_flash_head_special_token_ids,
+        )
+
+        # detect_flash_head_config returns (model_dir, cache_dir)
+        # model_dir may differ from model_path for GGUF files
+        self.flash_head_model_dir, self.flash_head_cache_dir = detect_flash_head_config(
+            self.model_path, os.path.basename(self.model_path)
+        )
+        self.flash_head_enabled = self.flash_head_cache_dir is not None
+        self.flash_head_special_token_ids = None
+
+        if self.flash_head_enabled:
+            self.flash_head_special_token_ids = get_flash_head_special_token_ids(
+                self.flash_head_model_dir
+            )
+            logger.info(
+                f"[FlashHead] Enabled for model {self.model_path}, "
+                f"model_dir={self.flash_head_model_dir}, "
+                f"cache_dir={self.flash_head_cache_dir}"
+            )
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,

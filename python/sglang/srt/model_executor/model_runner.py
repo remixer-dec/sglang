@@ -863,6 +863,9 @@ class ModelRunner:
                 self.pp_rank,
             )
 
+        # Initialize FlashHead if enabled in model config
+        self._initialize_flash_head()
+
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
             self.model,
@@ -888,6 +891,35 @@ class ModelRunner:
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+    def _initialize_flash_head(self) -> None:
+        """Initialize FlashHead if enabled in model config.
+
+        FlashHead is a drop-in module for the lm_head layer that speeds up
+        token generation by up to 50% using a clustering-based approach.
+        """
+        if not getattr(self.model_config, "flash_head_enabled", False):
+            return
+
+        # Find the logits_processor and lm_head in the model
+        logits_processor = getattr(self.model, "logits_processor", None)
+        lm_head = getattr(self.model, "lm_head", None)
+
+        if logits_processor is None:
+            logger.warning(
+                "[FlashHead] Cannot initialize: model has no logits_processor"
+            )
+            return
+
+        if lm_head is None:
+            logger.warning("[FlashHead] Cannot initialize: model has no lm_head")
+            return
+
+        # Initialize FlashHead in the logits_processor
+        try:
+            logits_processor.initialize_flash_head(lm_head, self.model_config)
+        except Exception as e:
+            logger.warning(f"[FlashHead] Failed to initialize: {e}")
 
     def update_expert_location(
         self,

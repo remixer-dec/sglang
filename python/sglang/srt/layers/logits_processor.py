@@ -272,6 +272,59 @@ class LogitsProcessor(nn.Module):
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.value
 
+        # FlashHead support - will be initialized later when lm_head is available
+        self.flash_head = None
+        self.flash_head_enabled = getattr(config, "flash_head_enabled", False)
+
+    def initialize_flash_head(
+        self,
+        lm_head: VocabParallelEmbedding,
+        model_config,
+    ) -> None:
+        """Initialize FlashHead if enabled in the model config.
+
+        This should be called after the model weights are loaded and the lm_head
+        is available.
+
+        Args:
+            lm_head: The language model head layer.
+            model_config: The model configuration with FlashHead settings.
+        """
+        if not getattr(model_config, "flash_head_enabled", False):
+            return
+
+        if self.flash_head is not None:
+            return  # Already initialized
+
+        from sglang.srt.layers.flash_head import load_flash_head_from_config
+
+        # Get lm_head weight
+        if hasattr(lm_head, "weight"):
+            lm_head_weight = lm_head.weight.data
+        else:
+            logger.warning("[FlashHead] Cannot initialize: lm_head has no weight attribute")
+            return
+
+        try:
+            # Use flash_head_model_dir which may differ from model_path for GGUF
+            model_dir = getattr(
+                model_config, "flash_head_model_dir", model_config.model_path
+            )
+            self.flash_head = load_flash_head_from_config(
+                model_dir=model_dir,
+                flash_head_cache_dir=model_config.flash_head_cache_dir,
+                vocab_size=model_config.vocab_size,
+                hidden_size=model_config.hidden_size,
+                lm_head_weight=lm_head_weight,
+                device=lm_head_weight.device,
+                dtype=lm_head_weight.dtype,
+                special_token_ids=model_config.flash_head_special_token_ids,
+            )
+            logger.info("[FlashHead] Successfully initialized")
+        except Exception as e:
+            logger.warning(f"[FlashHead] Failed to initialize: {e}")
+            self.flash_head = None
+
     def compute_logprobs_for_multi_item_scoring(
         self,
         input_ids,
@@ -828,7 +881,27 @@ class LogitsProcessor(nn.Module):
         If sampled_logits_only is True, it means hidden_states only contain the
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
+
+        When FlashHead is enabled and the batch size is 1, this method returns
+        token IDs directly instead of logits. The Sampler is modified to handle
+        this case.
         """
+        # FlashHead fast path: use FlashHead for single-token generation
+        # Returns token IDs directly instead of logits
+        if (
+            self.flash_head is not None
+            and hidden_states.shape[0] == 1
+            and not logits_metadata.extend_return_logprob
+            and logits_metadata.forward_mode.is_decode_or_idle()
+        ):
+            # FlashHead expects [batch, seq_len, hidden_size]
+            # hidden_states is [batch * seq_len, hidden_size]
+            hidden_states_3d = hidden_states.unsqueeze(0)
+            next_token_ids = self.flash_head.get_next_token(hidden_states_3d)
+            # Return token IDs in a format the sampler can detect
+            # Shape: [1, 1] with dtype int64
+            return next_token_ids.view(-1).to(torch.int64)
+
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
             hidden_states, local_hidden_states = (
