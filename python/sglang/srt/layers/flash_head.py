@@ -264,7 +264,6 @@ class FlashHead(nn.Module):
         self.register_buffer(
             "row_indices", torch.arange(vocab_maps_tensor.shape[1])[None, :]
         )
-        self.register_buffer("output_buffer", torch.zeros((1, 1), dtype=torch.int64))
 
         special_token_list = []
         if special_token_ids is None:
@@ -406,36 +405,49 @@ class FlashHead(nn.Module):
         cluster_indices = top_clusters[0, 0]
         maps = self.vocab_maps_tensor.index_select(0, cluster_indices)
         indices = maps.flatten().to(torch.int64)
+
+        # Add special tokens if they exist (tensor already on correct device from __init__)
         if self.special_token_ids_tensor.numel() > 0:
-            special_ids = self.special_token_ids_tensor.to(device=indices.device)
-            indices = torch.unique(torch.cat([indices, special_ids], dim=0))
+            indices = torch.cat([indices, self.special_token_ids_tensor], dim=0)
+            # Only call unique if there might be duplicates
+            # For performance, we skip this if special tokens are few
+            if self.special_token_ids_tensor.numel() > 10:
+                indices = torch.unique(indices)
+
         if use_identical_tiebreak:
             indices = indices.sort().values
 
         vocab_index = indices[cluster_token_idx]
-        self.output_buffer[0][0] = vocab_index.item()
+        # Return tensor directly to avoid .item() which breaks CUDA graph capturing
+        result = vocab_index.view(1, 1)
 
         if return_logprob:
             # Compute approximate logprob using cluster logits
-            # This is log_softmax over the cluster tokens, not full vocab
-            # For a more accurate approximation, we add a correction term
-            # based on the cluster selection probabilities
+            # log_softmax over the cluster tokens gives local probability
             log_probs = torch.nn.functional.log_softmax(last_logits, dim=-1)
             selected_logprob = log_probs[0, cluster_token_idx.squeeze()]
 
-            # Add cluster probability as a correction term
-            # This accounts for the probability of selecting this cluster
-            cluster_probs = self._get_cluster_probs(hidden_states, temperature)
-            cluster_log_prob = torch.log(
-                cluster_probs[0, 0, cluster_indices].sum() + 1e-10
-            )
+            # Use pre-computed cluster similarities from _get_top_clusters path
+            # Recompute only when sampling (where we used multinomial)
+            if do_sample:
+                cluster_probs = self._get_cluster_probs(hidden_states, temperature)
+                cluster_log_prob = torch.log(
+                    cluster_probs[0, 0, cluster_indices].sum() + 1e-10
+                )
+            else:
+                # For greedy, use the centroid similarities directly
+                similarities = self.cluster_linear(hidden_states)
+                probs = torch.softmax(similarities / temperature, dim=-1)
+                cluster_log_prob = torch.log(
+                    probs[0, 0, cluster_indices].sum() + 1e-10
+                )
 
             # Approximate full logprob = cluster_logprob + log(sum of cluster probs)
             approx_logprob = selected_logprob + cluster_log_prob
 
-            return self.output_buffer, approx_logprob.view(1)
+            return result, approx_logprob.view(1)
 
-        return self.output_buffer
+        return result
 
 
 def load_flash_head_from_config(

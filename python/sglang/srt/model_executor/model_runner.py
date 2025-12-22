@@ -2780,9 +2780,18 @@ class ModelRunner:
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
 
+        logits = logits_output.next_token_logits
+        if logits is None:
+            return
+
+        # Skip preprocessing if FlashHead returned token IDs instead of logits
+        # Token IDs are detected by int dtype and small shape
+        if logits.dtype in (torch.int32, torch.int64):
+            return
+
         # Calculate logits bias and apply it to next_token_logits.
         sampling_info.update_regex_vocab_mask()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+        sampling_info.apply_logits_bias(logits)
 
     def sample(
         self,

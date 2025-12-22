@@ -150,6 +150,9 @@ class LogitsMetadata:
     # FlashHead approximate logprob (set by _get_logits when FlashHead is used with logprobs)
     flash_head_logprob: Optional[torch.Tensor] = None
 
+    # Whether grammar/constrained decoding is active (disables FlashHead)
+    has_grammar: bool = False
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         if (
@@ -201,6 +204,11 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             return_logprob=forward_batch.return_logprob,
+            has_grammar=(
+                forward_batch.sampling_info is not None
+                and forward_batch.sampling_info.grammars is not None
+                and any(g is not None for g in forward_batch.sampling_info.grammars)
+            ),
         )
 
     def compute_dp_attention_metadata(self):
@@ -899,10 +907,12 @@ class LogitsProcessor(nn.Module):
         """
         # FlashHead fast path: use FlashHead for single-token generation
         # Returns token IDs directly instead of logits (with optional approximate logprob)
+        # Skip FlashHead when grammar/constrained decoding is active (needs full logits for vocab mask)
         if (
             self.flash_head is not None
             and hidden_states.shape[0] == 1
             and logits_metadata.forward_mode.is_decode_or_idle()
+            and not logits_metadata.has_grammar
         ):
             # FlashHead expects [batch, seq_len, hidden_size]
             # hidden_states is [batch * seq_len, hidden_size]
