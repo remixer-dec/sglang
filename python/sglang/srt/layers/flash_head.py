@@ -459,7 +459,8 @@ def load_flash_head_from_config(
     device: torch.device,
     dtype: torch.dtype,
     special_token_ids: Optional[Union[int, Iterable[int]]] = None,
-) -> FlashHead:
+    use_triton: Optional[bool] = None,
+) -> nn.Module:
     """
     Load a FlashHead module from the model configuration.
 
@@ -472,6 +473,8 @@ def load_flash_head_from_config(
         device: The device to load the module on.
         dtype: The dtype for the module.
         special_token_ids: Tokens to process independently of clusters.
+        use_triton: If True, use Triton-accelerated FlashHead. If None, auto-detect
+                   based on attention_backend setting.
 
     Returns:
         A FlashHead module initialized with the cache weights.
@@ -485,6 +488,40 @@ def load_flash_head_from_config(
         dtype=dtype,
     )
 
+    # Determine whether to use Triton FlashHead
+    if use_triton is None:
+        # Auto-detect based on attention backend
+        try:
+            from sglang.srt.server_args import get_global_server_args
+            server_args = get_global_server_args()
+            use_triton = server_args is not None and server_args.attention_backend == "triton"
+        except Exception:
+            use_triton = False
+
+    if use_triton:
+        try:
+            from sglang.srt.layers.triton_flash_head import create_triton_flash_head
+
+            flash_head = create_triton_flash_head(
+                lm_head_weight=lm_head_weight,
+                centroids=params["centroids"],
+                vocab_maps_tensor=params["vocab_maps_tensor"],
+                version="v2",  # Use V2 (separate kernels) for better occupancy
+            )
+
+            logger.info(
+                f"[FlashHead] Initialized TRITON version with cache from {flash_head_cache_dir}, "
+                f"vocab_size={vocab_size}, hidden_size={hidden_size}"
+            )
+
+            return flash_head
+
+        except ImportError as e:
+            logger.warning(f"[FlashHead] Triton not available, falling back to PyTorch: {e}")
+        except Exception as e:
+            logger.warning(f"[FlashHead] Failed to initialize Triton version, falling back to PyTorch: {e}")
+
+    # Fall back to PyTorch implementation
     flash_head = FlashHead(
         lm_head_weight=lm_head_weight,
         centroids=params["centroids"],
@@ -493,7 +530,7 @@ def load_flash_head_from_config(
     ).to(device=device, dtype=dtype)
 
     logger.info(
-        f"[FlashHead] Initialized with cache from {flash_head_cache_dir}, "
+        f"[FlashHead] Initialized PyTorch version with cache from {flash_head_cache_dir}, "
         f"vocab_size={vocab_size}, hidden_size={hidden_size}"
     )
 
